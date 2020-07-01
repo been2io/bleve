@@ -18,16 +18,28 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+
+	"github.com/bmkessler/streamvbyte"
 )
 
+// We can safely use 0 to represent termNotEncoded since 0
+// could never be a valid address for term location information.
+// (stored field index is always non-empty and earlier in the
+// file)
+const termNotEncoded = 0
+
 type chunkedIntCoder struct {
-	final     []byte
-	chunkSize uint64
-	chunkBuf  bytes.Buffer
-	chunkLens []uint64
-	currChunk uint64
+	final       []byte
+	chunkSize   uint64
+	chunkBuf    bytes.Buffer
+	chunkLens   []uint64
+	chunkCounts []uint64
+	currChunk   uint64
 
 	buf []byte
+
+	vals    []uint32
+	encoded []byte
 }
 
 // newChunkedIntCoder returns a new chunk int coder which packs data into
@@ -36,9 +48,12 @@ type chunkedIntCoder struct {
 func newChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *chunkedIntCoder {
 	total := maxDocNum/chunkSize + 1
 	rv := &chunkedIntCoder{
-		chunkSize: chunkSize,
-		chunkLens: make([]uint64, total),
-		final:     make([]byte, 0, 64),
+		chunkSize:   chunkSize,
+		chunkLens:   make([]uint64, total),
+		chunkCounts: make([]uint64, total),
+		final:       make([]byte, 0, 64),
+		vals:        make([]uint32, 0, 512),
+		encoded:     make([]byte, 0, 512),
 	}
 
 	return rv
@@ -52,6 +67,23 @@ func (c *chunkedIntCoder) Reset() {
 	c.currChunk = 0
 	for i := range c.chunkLens {
 		c.chunkLens[i] = 0
+		c.chunkCounts[i] = 0
+	}
+	c.vals = c.vals[:0]
+	c.encoded = c.encoded[:0]
+}
+
+// SetChunkSize changes the chunk size.  It is only valid to do so
+// with a new chunkedIntCoder, or immediately after calling Reset()
+func (c *chunkedIntCoder) SetChunkSize(chunkSize uint64, maxDocNum uint64) {
+	total := int(maxDocNum/chunkSize + 1)
+	c.chunkSize = chunkSize
+	if cap(c.chunkLens) < total {
+		c.chunkLens = make([]uint64, total)
+		c.chunkCounts = make([]uint64, total)
+	} else {
+		c.chunkLens = c.chunkLens[:total]
+		c.chunkCounts = c.chunkCounts[:total]
 	}
 }
 
@@ -64,18 +96,12 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 		c.Close()
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
-	}
-
-	if len(c.buf) < binary.MaxVarintLen64 {
-		c.buf = make([]byte, binary.MaxVarintLen64)
+		c.vals = c.vals[:0]
+		c.encoded = c.encoded[:0]
 	}
 
 	for _, val := range vals {
-		wb := binary.PutUvarint(c.buf, val)
-		_, err := c.chunkBuf.Write(c.buf[:wb])
-		if err != nil {
-			return err
-		}
+		c.vals = append(c.vals, uint32(val))
 	}
 
 	return nil
@@ -88,6 +114,8 @@ func (c *chunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 		c.Close()
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
+		c.vals = c.vals[:0]
+		c.encoded = c.encoded[:0]
 	}
 
 	_, err := c.chunkBuf.Write(buf)
@@ -97,16 +125,26 @@ func (c *chunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 // Close indicates you are done calling Add() this allows the final chunk
 // to be encoded.
 func (c *chunkedIntCoder) Close() {
-	encodingBytes := c.chunkBuf.Bytes()
-	c.chunkLens[c.currChunk] = uint64(len(encodingBytes))
-	c.final = append(c.final, encodingBytes...)
-	c.currChunk = uint64(cap(c.chunkLens)) // sentinel to detect double close
+	if len(c.vals) > 0 {
+		esize := streamvbyte.MaxSize32(len(c.vals))
+		if cap(c.encoded) < esize {
+			c.encoded = make([]byte, esize)
+		} else {
+			c.encoded = c.encoded[:esize]
+		}
+		streamvbyte.EncodeUint32(c.encoded, c.vals)
+	}
+
+	c.final = append(c.final, c.encoded...)
+	c.chunkLens[c.currChunk] = uint64(len(c.encoded))
+	c.chunkCounts[c.currChunk] = uint64(len(c.vals))
+	c.currChunk = uint64(cap(c.chunkLens))
 }
 
 // Write commits all the encoded chunked integers to the provided writer.
 func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
-	bufNeeded := binary.MaxVarintLen64 * (1 + len(c.chunkLens))
-	if len(c.buf) < bufNeeded {
+	bufNeeded := 2 * binary.MaxVarintLen64 * (1 + len(c.chunkLens))
+	if cap(c.buf) < bufNeeded {
 		c.buf = make([]byte, bufNeeded)
 	}
 	buf := c.buf
@@ -116,8 +154,9 @@ func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
 
 	// write out the number of chunks & each chunk offsets
 	n := binary.PutUvarint(buf, uint64(len(chunkOffsets)))
-	for _, chunkOffset := range chunkOffsets {
+	for i, chunkOffset := range chunkOffsets {
 		n += binary.PutUvarint(buf[n:], chunkOffset)
+		n += binary.PutUvarint(buf[n:], c.chunkCounts[i])
 	}
 
 	tw, err := w.Write(buf[:n])
@@ -132,6 +171,22 @@ func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
 		return tw, err
 	}
 	return tw, nil
+}
+
+// writeAt commits all the encoded chunked integers to the provided writer
+// and returns the starting offset, total bytes written and an error
+func (c *chunkedIntCoder) writeAt(w io.Writer) (uint64, int, error) {
+	startOffset := uint64(termNotEncoded)
+	if len(c.final) <= 0 {
+		return startOffset, 0, nil
+	}
+
+	if chw := w.(*CountHashWriter); chw != nil {
+		startOffset = uint64(chw.Count())
+	}
+
+	tw, err := c.Write(w)
+	return startOffset, tw, err
 }
 
 func (c *chunkedIntCoder) FinalSize() int {

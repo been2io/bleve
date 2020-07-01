@@ -61,7 +61,7 @@ func AnalysisResultsToSegmentBase(results []*index.AnalysisResult,
 	}
 
 	s.results = results
-	s.chunkFactor = chunkFactor
+	s.chunkMode = chunkFactor
 	s.w = NewCountHashWriter(&br)
 
 	storedIndexOffset, fieldsIndexOffset, fdvIndexOffset, dictOffsets,
@@ -90,7 +90,7 @@ var interimPool = sync.Pool{New: func() interface{} { return &interim{} }}
 type interim struct {
 	results []*index.AnalysisResult
 
-	chunkFactor uint32
+	chunkMode uint32
 
 	w *CountHashWriter
 
@@ -142,7 +142,7 @@ type interim struct {
 
 func (s *interim) reset() (err error) {
 	s.results = nil
-	s.chunkFactor = 0
+	s.chunkMode = 0
 	s.w = nil
 	s.FieldsMap = nil
 	s.FieldsInv = nil
@@ -610,9 +610,11 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 
 	buf := s.grabBuf(binary.MaxVarintLen64)
 
-	tfEncoder := newChunkedIntCoder(uint64(s.chunkFactor), uint64(len(s.results)-1))
-	locEncoder := newChunkedIntCoder(uint64(s.chunkFactor), uint64(len(s.results)-1))
-	fdvEncoder := newChunkedContentCoder(uint64(s.chunkFactor), uint64(len(s.results)-1), s.w, false)
+	// these int coders are initialized with chunk size 1024
+	// however this will be reset to the correct chunk size
+	// while processing each individual field-term section
+	tfEncoder := newChunkedIntCoder(1024, uint64(len(s.results)-1))
+	locEncoder := newChunkedIntCoder(1024, uint64(len(s.results)-1))
 
 	var docTermMap [][]byte
 
@@ -646,6 +648,13 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 			locs := s.Locs[pid]
 			locOffset := 0
 
+			chunkSize, err := getChunkSize(s.chunkMode, postingsBS.GetCardinality(), uint64(len(s.results)))
+			if err != nil {
+				return 0, nil, err
+			}
+			tfEncoder.SetChunkSize(chunkSize, uint64(len(s.results)-1))
+			locEncoder.SetChunkSize(chunkSize, uint64(len(s.results)-1))
+
 			postingsItr := postingsBS.Iterator()
 			for postingsItr.HasNext() {
 				docNum := uint64(postingsItr.Next())
@@ -662,7 +671,7 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 				if freqNorm.numLocs > 0 {
 					numBytesLocs := 0
 					for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-						numBytesLocs += totalUvarintBytes(
+						numBytesLocs += totalNumbers(
 							uint64(loc.fieldID), loc.pos, loc.start, loc.end,
 							uint64(len(loc.arrayposs)), loc.arrayposs)
 					}
@@ -748,6 +757,12 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 		}
 
 		// write the field doc values
+		// NOTE: doc values continue to use legacy chunk mode
+		chunkSize, err := getChunkSize(LegacyChunkMode, 0, 0)
+		if err != nil {
+			return 0, nil, err
+		}
+		fdvEncoder := newChunkedContentCoder(chunkSize, uint64(len(s.results)-1), s.w, false)
 		if s.IncludeDocValues[fieldID] {
 			for docNum, docTerms := range docTermMap {
 				if len(docTerms) > 0 {
@@ -836,4 +851,9 @@ func numUvarintBytes(x uint64) (n int) {
 		n++
 	}
 	return n + 1
+}
+
+func totalNumbers(a, b, c, d, e uint64, more []uint64) (n int) {
+	n = 5 + len(more)
+	return
 }

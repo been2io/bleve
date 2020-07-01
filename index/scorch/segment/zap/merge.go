@@ -31,6 +31,8 @@ import (
 
 var DefaultFileMergerBufferSize = 1024 * 1024
 
+
+
 // ValidateMerge can be set by applications to perform additional checks
 // on a new segment produced by a merge, by default this does nothing.
 // Caller should provide EITHER segments or memSegments, but not both.
@@ -113,7 +115,7 @@ func MergeSegmentBases(segmentBases []*SegmentBase, drops []*roaring.Bitmap, pat
 }
 
 func MergeToWriter(segments []*SegmentBase, drops []*roaring.Bitmap,
-	chunkFactor uint32, cr *CountHashWriter, closeCh chan struct{}) (
+	chunkMode uint32, cr *CountHashWriter, closeCh chan struct{}) (
 	newDocNums [][]uint64,
 	numDocs, storedIndexOffset, fieldsIndexOffset, docValueOffset uint64,
 	dictLocs []uint64, fieldsInv []string, fieldsMap map[string]uint16,
@@ -139,7 +141,7 @@ func MergeToWriter(segments []*SegmentBase, drops []*roaring.Bitmap,
 
 		dictLocs, docValueOffset, err = persistMergedRest(segments, drops,
 			fieldsInv, fieldsMap, fieldsSame,
-			newDocNums, numDocs, chunkFactor, cr, closeCh)
+			newDocNums, numDocs, chunkMode, cr, closeCh)
 		if err != nil {
 			return nil, 0, 0, 0, 0, nil, nil, nil, err
 		}
@@ -180,7 +182,7 @@ func computeNewDocCount(segments []*SegmentBase, drops []*roaring.Bitmap) uint64
 
 func persistMergedRest(segments []*SegmentBase, dropsIn []*roaring.Bitmap,
 	fieldsInv []string, fieldsMap map[string]uint16, fieldsSame bool,
-	newDocNumsIn [][]uint64, newSegDocCount uint64, chunkFactor uint32,
+	newDocNumsIn [][]uint64, newSegDocCount uint64, chunkMode uint32,
 	w *CountHashWriter, closeCh chan struct{}) ([]uint64, uint64, error) {
 
 	var bufMaxVarintLen64 []byte = make([]byte, binary.MaxVarintLen64)
@@ -193,8 +195,11 @@ func persistMergedRest(segments []*SegmentBase, dropsIn []*roaring.Bitmap,
 	fieldDvLocsStart := make([]uint64, len(fieldsInv))
 	fieldDvLocsEnd := make([]uint64, len(fieldsInv))
 
-	tfEncoder := newChunkedIntCoder(uint64(chunkFactor), newSegDocCount-1)
-	locEncoder := newChunkedIntCoder(uint64(chunkFactor), newSegDocCount-1)
+	// these int coders are initialized with chunk size 1024
+	// however this will be reset to the correct chunk size
+	// while processing each individual field-term section
+	tfEncoder := newChunkedIntCoder(1024, newSegDocCount-1)
+	locEncoder := newChunkedIntCoder(1024, newSegDocCount-1)
 
 	var vellumBuf bytes.Buffer
 	newVellum, err := vellum.New(&vellumBuf, nil)
@@ -311,6 +316,26 @@ func persistMergedRest(segments []*SegmentBase, dropsIn []*roaring.Bitmap,
 					return nil, 0, err
 				}
 			}
+			if !bytes.Equal(prevTerm, term) || prevTerm == nil {
+				// compute cardinality of field-term in new seg
+				var newCard uint64
+				lowItrIdxs, lowItrVals := enumerator.GetLowIdxsAndValues()
+				for i, idx := range lowItrIdxs {
+					pl, err := dicts[idx].postingsListFromOffset(lowItrVals[i], drops[idx], nil)
+					if err != nil {
+						return nil, 0, err
+					}
+					newCard += pl.Count()
+				}
+				// compute correct chunk size with this
+				chunkSize, err := getChunkSize(chunkMode, newCard, newSegDocCount)
+				if err != nil {
+					return nil, 0, err
+				}
+				// update encoders chunk
+				tfEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+				locEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+			}
 
 			postings, err = dicts[itrI].postingsListFromOffset(
 				postingsOffset, drops[itrI], postings)
@@ -320,16 +345,11 @@ func persistMergedRest(segments []*SegmentBase, dropsIn []*roaring.Bitmap,
 
 			postItr = postings.iterator(true, true, true, postItr)
 
-			if fieldsSame {
-				// can optimize by copying freq/norm/loc bytes directly
-				lastDocNum, lastFreq, lastNorm, err = mergeTermFreqNormLocsByCopying(
-					term, postItr, newDocNums[itrI], newRoaring,
-					tfEncoder, locEncoder)
-			} else {
-				lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocs(
-					fieldsMap, term, postItr, newDocNums[itrI], newRoaring,
-					tfEncoder, locEncoder, bufLoc)
-			}
+			// can no longer optimize by copying, since chunk factor could have changed
+			lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocs(
+				fieldsMap, term, postItr, newDocNums[itrI], newRoaring,
+				tfEncoder, locEncoder, bufLoc)
+
 			if err != nil {
 				return nil, 0, err
 			}
@@ -375,7 +395,12 @@ func persistMergedRest(segments []*SegmentBase, dropsIn []*roaring.Bitmap,
 		fieldDvLocsStart[fieldID] = uint64(w.Count())
 
 		// update the field doc values
-		fdvEncoder := newChunkedContentCoder(uint64(chunkFactor), newSegDocCount-1, w, true)
+		// NOTE: doc values continue to use legacy chunk mode
+		chunkSize, err := getChunkSize(LegacyChunkMode, 0, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		fdvEncoder := newChunkedContentCoder(chunkSize, newSegDocCount-1, w, true)
 
 		fdvReadersAvailable := false
 		var dvIterClone *docValueReader
@@ -480,7 +505,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 			numBytesLocs := 0
 			for _, loc := range locs {
 				ap := loc.ArrayPositions()
-				numBytesLocs += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
+				numBytesLocs += totalNumbers(uint64(fieldsMap[loc.Field()]-1),
 					loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
 			}
 
@@ -518,42 +543,6 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 	return lastDocNum, lastFreq, lastNorm, bufLoc, err
 }
 
-func mergeTermFreqNormLocsByCopying(term []byte, postItr *PostingsIterator,
-	newDocNums []uint64, newRoaring *roaring.Bitmap,
-	tfEncoder *chunkedIntCoder, locEncoder *chunkedIntCoder) (
-	lastDocNum uint64, lastFreq uint64, lastNorm uint64, err error) {
-	nextDocNum, nextFreq, nextNorm, nextFreqNormBytes, nextLocBytes, err :=
-		postItr.nextBytes()
-	for err == nil && len(nextFreqNormBytes) > 0 {
-		hitNewDocNum := newDocNums[nextDocNum]
-		if hitNewDocNum == docDropped {
-			return 0, 0, 0, fmt.Errorf("see hit with dropped doc num")
-		}
-
-		newRoaring.Add(uint32(hitNewDocNum))
-		err = tfEncoder.AddBytes(hitNewDocNum, nextFreqNormBytes)
-		if err != nil {
-			return 0, 0, 0, err
-		}
-
-		if len(nextLocBytes) > 0 {
-			err = locEncoder.AddBytes(hitNewDocNum, nextLocBytes)
-			if err != nil {
-				return 0, 0, 0, err
-			}
-		}
-
-		lastDocNum = hitNewDocNum
-		lastFreq = nextFreq
-		lastNorm = nextNorm
-
-		nextDocNum, nextFreq, nextNorm, nextFreqNormBytes, nextLocBytes, err =
-			postItr.nextBytes()
-	}
-
-	return lastDocNum, lastFreq, lastNorm, err
-}
-
 func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
 	use1HitEncoding func(uint64) (bool, uint64, uint64),
 	w *CountHashWriter, bufMaxVarintLen64 []byte) (
@@ -570,14 +559,14 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCo
 		}
 	}
 
-	tfOffset := uint64(w.Count())
-	_, err = tfEncoder.Write(w)
+	var tfOffset uint64
+	tfOffset, _, err = tfEncoder.writeAt(w)
 	if err != nil {
 		return 0, err
 	}
 
-	locOffset := uint64(w.Count())
-	_, err = locEncoder.Write(w)
+	var locOffset uint64
+	locOffset, _, err = locEncoder.writeAt(w)
 	if err != nil {
 		return 0, err
 	}

@@ -243,10 +243,8 @@ OUTER:
 				}
 			}
 
-			// The actual bitmaps and docNum1Hits all contain or have
-			// the same 1-hit docNum, so that's our AND'ed result.
 			oTFR.iterators[i], err = zap.PostingsIteratorFrom1Hit(
-				docNum1HitLast, zap.NormBits1Hit, false, false)
+				docNum1HitLast, false, false)
 			if err != nil {
 				return nil, nil
 			}

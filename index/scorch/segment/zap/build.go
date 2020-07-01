@@ -21,7 +21,7 @@ import (
 	"os"
 )
 
-const Version uint32 = 11
+const Version uint32 = 14
 
 const Type string = "zap"
 
@@ -50,7 +50,7 @@ func PersistSegmentBase(sb *SegmentBase, path string) error {
 	}
 
 	err = persistFooter(sb.numDocs, sb.storedIndexOffset, sb.fieldsIndexOffset, sb.docValueOffset,
-		sb.chunkFactor, sb.memCRC, br)
+		sb.chunkMode, sb.memCRC, br)
 	if err != nil {
 		cleanup()
 		return err
@@ -129,7 +129,7 @@ func InitSegmentBase(mem []byte, memCRC uint32, chunkFactor uint32,
 	sb := &SegmentBase{
 		mem:               mem,
 		memCRC:            memCRC,
-		chunkFactor:       chunkFactor,
+		chunkMode:         chunkFactor,
 		fieldsMap:         fieldsMap,
 		fieldsInv:         fieldsInv,
 		numDocs:           numDocs,
