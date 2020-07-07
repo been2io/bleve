@@ -31,8 +31,14 @@ type chunkedIntDecoder struct {
 	svbr            *streamVbReader
 }
 
-func newChunkedIntDecoder(buf []byte, offset uint64) *chunkedIntDecoder {
-	rv := &chunkedIntDecoder{startOffset: offset, data: buf}
+func newChunkedIntDecoder(buf []byte, offset uint64, rv *chunkedIntDecoder) *chunkedIntDecoder {
+	if rv == nil {
+		rv = &chunkedIntDecoder{startOffset: offset, data: buf}
+	} else {
+		rv.data = buf
+		rv.startOffset = offset
+	}
+
 	var n, numChunks uint64
 	var read int
 	if offset == termNotEncoded {
@@ -86,11 +92,13 @@ func (d *chunkedIntDecoder) loadChunk(chunk int) error {
 func (d *chunkedIntDecoder) reset() {
 	d.startOffset = 0
 	d.dataStartOffset = 0
-	d.chunkOffsets = d.chunkOffsets[:0]
-	d.chunkCounts = d.chunkCounts[:0]
+	for i := range d.chunkOffsets {
+		d.chunkOffsets[i] = 0
+		d.chunkCounts[i] = 0
+	}
 	d.data = d.data[:0]
 	if d.svbr != nil {
-		d.svbr.reset([]byte(nil), 0)
+		d.svbr.reset(nil, 0)
 	}
 }
 
