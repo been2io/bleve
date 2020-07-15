@@ -392,7 +392,7 @@ func init() {
 // needed to execute a search request.
 func memNeededForSearch(req *SearchRequest,
 	searcher search.Searcher,
-	topnCollector *collector.TopNCollector) uint64 {
+	topnCollector *collector.StreamCollector) uint64 {
 
 	backingSize := req.Size + req.From + 1
 	if req.Size+req.From > collector.PreAllocSizeSkipCap {
@@ -451,11 +451,11 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 		req.SearchBefore = nil
 	}
 
-	var coll *collector.TopNCollector
+	var coll *collector.StreamCollector
 	if req.SearchAfter != nil {
-		coll = collector.NewTopNCollectorAfter(req.Size, req.Sort, req.SearchAfter)
+		coll = collector.NewStreamCollectorAfter(req.Size, req.Sort, req.SearchAfter)
 	} else {
-		coll = collector.NewTopNCollector(req.Size, req.From, req.Sort)
+		coll = collector.NewStreamCollector(req.Size, req.From, req.Sort)
 	}
 
 	// open a reader for this search
@@ -463,11 +463,11 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 	if err != nil {
 		return nil, fmt.Errorf("error opening index reader %v", err)
 	}
-	defer func() {
+	/*defer func() {
 		if cerr := indexReader.Close(); err == nil && cerr != nil {
 			err = cerr
 		}
-	}()
+	}()*/
 
 	searcher, err := req.Query.Searcher(indexReader, i.m, search.SearcherOptions{
 		Explain:            req.Explain,

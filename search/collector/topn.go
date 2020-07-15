@@ -163,14 +163,14 @@ func (hc *TopNCollector) Collect(ctx context.Context, searcher search.Searcher, 
 	// pre-allocate enough space in the DocumentMatchPool
 	// unless the size + skip is too large, then cap it
 	// everything should still work, just allocates DocumentMatches on demand
-	backingSize := hc.size + hc.skip + 1
-	if hc.size+hc.skip > PreAllocSizeSkipCap {
-		backingSize = PreAllocSizeSkipCap + 1
-	}
+	/*	backingSize := hc.size + hc.skip + 1
+		if hc.size+hc.skip > PreAllocSizeSkipCap {
+			backingSize = PreAllocSizeSkipCap + 1
+		}*/
 	searchContext := &search.SearchContext{
-		DocumentMatchPool: search.NewDocumentMatchPool(backingSize+searcher.DocumentMatchPoolSize(), len(hc.sort)),
-		Collector:         hc,
-		IndexReader:       reader,
+		//DocumentMatchPool: search.NewDocumentMatchPool(backingSize+searcher.DocumentMatchPoolSize(), len(hc.sort)),
+		Collector:   hc,
+		IndexReader: reader,
 	}
 
 	hc.dvReader, err = reader.DocValueReader(hc.neededFields)

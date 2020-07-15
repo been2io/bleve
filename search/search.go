@@ -166,6 +166,8 @@ type DocumentMatch struct {
 	// be later incorporated into the Locations map when search
 	// results are completed
 	FieldTermLocations []FieldTermLocation `json:"-"`
+
+	DocReader index.IndexReader `json:"-"`
 }
 
 func (dm *DocumentMatch) AddFieldValue(name string, value interface{}) {
@@ -360,6 +362,9 @@ type SearchContext struct {
 	DocumentMatchPool *DocumentMatchPool
 	Collector         Collector
 	IndexReader       index.IndexReader
+	PoolSize          int
+	SearcherSize      int
+	SortSize          int
 }
 
 func (sc *SearchContext) Size() int {

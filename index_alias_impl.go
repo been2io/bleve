@@ -25,6 +25,8 @@ import (
 	"github.com/blevesearch/bleve/index/store"
 	"github.com/blevesearch/bleve/mapping"
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/search/collector"
+	"github.com/blevesearch/bleve/search/highlight"
 )
 
 type indexAliasImpl struct {
@@ -440,6 +442,30 @@ func createChildSearchRequest(req *SearchRequest) *SearchRequest {
 	return &rv
 }
 
+func newSuperCollector(req *SearchRequest) *collector.SuperCollector {
+	var highlighter highlight.Highlighter
+	if req.Highlight != nil {
+		var err error
+		// get the right highlighter
+		highlighter, err = Config.Cache.HighlighterNamed(
+			Config.DefaultHighlighter)
+		if err != nil {
+			return nil
+		}
+		if req.Highlight.Style != nil {
+			highlighter, err = Config.Cache.HighlighterNamed(
+				*req.Highlight.Style)
+			if err != nil {
+				return nil
+			}
+		}
+		if highlighter == nil {
+			return nil
+		}
+	}
+	return collector.NewSuperCollector(req.Sort, highlighter, req.From, req.Size, req.SearchAfter)
+}
+
 type asyncSearchResult struct {
 	Name   string
 	Result *SearchResult
@@ -449,6 +475,12 @@ type asyncSearchResult struct {
 // MultiSearch executes a SearchRequest across multiple Index objects,
 // then merges the results.  The indexes must honor any ctx deadline.
 func MultiSearch(ctx context.Context, req *SearchRequest, indexes ...Index) (*SearchResult, error) {
+	sc := newSuperCollector(req)
+
+	var handlerMaker search.MakeDocumentMatchHandler
+	handlerMaker = sc.MakeStreamingDocumentMatchHandler
+	ctx = context.WithValue(ctx, search.MakeDocumentMatchHandlerKey,
+		handlerMaker)
 
 	searchStart := time.Now()
 	asyncResults := make(chan *asyncSearchResult, len(indexes))
@@ -499,6 +531,8 @@ func MultiSearch(ctx context.Context, req *SearchRequest, indexes ...Index) (*Se
 		}
 	}
 
+	sr.Hits = sc.Results()
+
 	// merge just concatenated all the hits
 	// now lets clean it up
 
@@ -512,10 +546,10 @@ func MultiSearch(ctx context.Context, req *SearchRequest, indexes ...Index) (*Se
 	}
 
 	// sort all hits with the requested order
-	if len(req.Sort) > 0 {
+	/*if len(req.Sort) > 0 {
 		sorter := newSearchHitSorter(req.Sort, sr.Hits)
 		sort.Sort(sorter)
-	}
+	}*/
 
 	// now skip over the correct From
 	if req.From > 0 && len(sr.Hits) > req.From {
@@ -561,6 +595,8 @@ func MultiSearch(ctx context.Context, req *SearchRequest, indexes ...Index) (*Se
 			sr.Status.Failed++
 		}
 	}
+
+	sc.CloseReaders()
 
 	return sr, nil
 }

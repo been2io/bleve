@@ -16,6 +16,7 @@ package search
 
 import (
 	"reflect"
+	"sync"
 )
 
 var reflectStaticSizeDocumentMatchPool int
@@ -36,6 +37,7 @@ type DocumentMatchPoolTooSmall func(p *DocumentMatchPool) *DocumentMatch
 // number of instances.  It is not thread-safe as currently all
 // aspects of search take place in a single goroutine.
 type DocumentMatchPool struct {
+	m        sync.Mutex
 	avail    DocumentMatchCollection
 	TooSmall DocumentMatchPoolTooSmall
 }
@@ -72,11 +74,13 @@ func NewDocumentMatchPool(size, sortsize int) *DocumentMatchPool {
 // of the pool.
 func (p *DocumentMatchPool) Get() *DocumentMatch {
 	var rv *DocumentMatch
+	p.m.Lock()
 	if len(p.avail) > 0 {
 		rv, p.avail = p.avail[len(p.avail)-1], p.avail[:len(p.avail)-1]
 	} else {
 		rv = p.TooSmall(p)
 	}
+	p.m.Unlock()
 	return rv
 }
 
@@ -87,5 +91,7 @@ func (p *DocumentMatchPool) Put(d *DocumentMatch) {
 	}
 	// reset DocumentMatch before returning it to available pool
 	d.Reset()
+	p.m.Lock()
 	p.avail = append(p.avail, d)
+	p.m.Unlock()
 }
