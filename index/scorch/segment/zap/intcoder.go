@@ -15,7 +15,6 @@
 package zap
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
 
@@ -31,7 +30,6 @@ const termNotEncoded = 0
 type chunkedIntCoder struct {
 	final       []byte
 	chunkSize   uint64
-	chunkBuf    bytes.Buffer
 	chunkLens   []uint64
 	chunkCounts []uint64
 	currChunk   uint64
@@ -52,8 +50,8 @@ func newChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *chunkedIntCoder {
 		chunkLens:   make([]uint64, total),
 		chunkCounts: make([]uint64, total),
 		final:       make([]byte, 0, 64),
-		vals:        make([]uint32, 0, 512),
-		encoded:     make([]byte, 0, 512),
+		vals:        make([]uint32, 0, 64),
+		encoded:     make([]byte, 0, 64),
 	}
 
 	return rv
@@ -63,7 +61,6 @@ func newChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *chunkedIntCoder {
 // from previous use.  you cannot change the chunk size or max doc num.
 func (c *chunkedIntCoder) Reset() {
 	c.final = c.final[:0]
-	c.chunkBuf.Reset()
 	c.currChunk = 0
 	for i := range c.chunkLens {
 		c.chunkLens[i] = 0
@@ -94,7 +91,6 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 	if chunk != c.currChunk {
 		// starting a new chunk
 		c.Close()
-		c.chunkBuf.Reset()
 		c.currChunk = chunk
 		c.vals = c.vals[:0]
 		c.encoded = c.encoded[:0]
@@ -112,14 +108,12 @@ func (c *chunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 	if chunk != c.currChunk {
 		// starting a new chunk
 		c.Close()
-		c.chunkBuf.Reset()
 		c.currChunk = chunk
 		c.vals = c.vals[:0]
 		c.encoded = c.encoded[:0]
 	}
 
-	_, err := c.chunkBuf.Write(buf)
-	return err
+	return nil
 }
 
 // Close indicates you are done calling Add() this allows the final chunk
@@ -132,7 +126,10 @@ func (c *chunkedIntCoder) Close() {
 		} else {
 			c.encoded = c.encoded[:esize]
 		}
-		streamvbyte.EncodeUint32(c.encoded, c.vals)
+		nb := streamvbyte.EncodeUint32(c.encoded, c.vals)
+		c.encoded = c.encoded[:nb]
+	} else {
+		c.encoded = c.encoded[:0]
 	}
 
 	c.final = append(c.final, c.encoded...)
@@ -144,7 +141,7 @@ func (c *chunkedIntCoder) Close() {
 // Write commits all the encoded chunked integers to the provided writer.
 func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
 	bufNeeded := 2 * binary.MaxVarintLen64 * (1 + len(c.chunkLens))
-	if cap(c.buf) < bufNeeded {
+	if len(c.buf) < bufNeeded {
 		c.buf = make([]byte, bufNeeded)
 	}
 	buf := c.buf

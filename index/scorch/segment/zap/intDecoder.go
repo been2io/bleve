@@ -67,7 +67,7 @@ func newChunkedIntDecoder(buf []byte, offset uint64, rv *chunkedIntDecoder) *chu
 
 func (d *chunkedIntDecoder) loadChunk(chunk int) error {
 	if d.startOffset == termNotEncoded {
-		d.svbr = newStreamVbReader([]byte(nil), 0) //segment.NewMemUvarintReader([]byte(nil))
+		d.svbr = newStreamVbReader([]byte(nil), 0)
 		return nil
 	}
 
@@ -111,7 +111,7 @@ func (d *chunkedIntDecoder) readUvarint() (uint64, error) {
 }
 
 func (d *chunkedIntDecoder) SkipUvarint() {
-	//d.svbr.Skip()
+	d.svbr.SkipOne()
 }
 
 func (d *chunkedIntDecoder) SkipBytes(count int) {
@@ -184,4 +184,8 @@ func (br *streamVbReader) Skip(skip int) error {
 	}
 	br.i = br.i + skip
 	return nil
+}
+
+func (br *streamVbReader) SkipOne() {
+	br.i++
 }
